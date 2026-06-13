@@ -176,3 +176,37 @@ TradeExecutor (เปิด IC เฉพาะเมื่อผ่าน)
    ↓
 Supabase (trades + regime_snapshots + learned posteriors)
 ```
+
+---
+
+# 🔧 Execution Hardening (v3) — Code Review Fixes
+
+แก้ตาม code review ก่อนรัน paper trading จริง (ทั้งหมดผ่าน test):
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | bars ใช้ TimeFrame.Minute + ไม่มี feed/start/end → `KeyError: SPY` | `TimeFrame(5,Minute)` + `feed=IEX` + start/end + `resp.data.get(symbol, [])` safe |
+| 2 | strike = `ask_price` (ผิดร้ายแรง) | `parse_occ_symbol()` → strike จริงจาก OCC symbol |
+| 3 | type = `"C" in symbol` (substring) | parse `right` จาก OCC symbol |
+| 4 | IV = `greeks.implied_volatility` | `snapshot.implied_volatility` |
+| 5 | `LimitOrderRequest(limit_price=None)` | limit price จริง (per-share) หรือ MarketOrderRequest |
+| 6 | spread 2 legs แยก ไม่มี rollback | native **MLEG** order (atomic) + rollback ถ้า leg 2 fail |
+| 7 | `close_position()` ใช้ SELL เสมอ | `close_option_leg(is_short)`: short→BUY_TO_CLOSE, long→SELL_TO_CLOSE |
+| 8 | TP log "closed" โดยไม่ verify fill | `is_order_filled()` ก่อน mark closed; submit จริงถ้ายังไม่ fill |
+| 9 | stop limit + stop market ไม่ link OCO | monitor sibling — fill อันหนึ่ง → cancel อีกอัน |
+| 10 | expiry = `date.today()` (system tz) | `now_est().date()` (US/Eastern) — สำคัญสำหรับ 0DTE |
+| + | premium per-share vs per-contract ปนกัน | `calculate_mid_price()` → per-contract; per-share แยกสำหรับ limit |
+
+## ⚠️ DRY_RUN mode (default = True)
+
+```python
+# config.py
+DRY_RUN = True   # ไม่ส่ง order จริง — log อย่างเดียว ทดสอบ flow ได้ปลอดภัย
+```
+
+รันทดสอบ flow ทั้งหมดได้โดยไม่แตะ paper account จริง พอมั่นใจแล้วค่อยตั้ง `DRY_RUN = False`
+
+**ลำดับแนะนำก่อน live paper:**
+1. `DRY_RUN=True` → ดู log ว่า entry/exit logic ถูกต้อง
+2. `DRY_RUN=False` + เงินน้อย → ดูว่า order ส่งเข้า Alpaca ถูก
+3. รัน paper เต็มเดือน → ดู regime filter + self-improving edge

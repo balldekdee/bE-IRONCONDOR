@@ -49,6 +49,15 @@ class IronCondor:
     # Stop Loss Orders
     call_stop_order_id: Optional[str] = None
     put_stop_order_id:  Optional[str] = None
+    # Stop-market backstop (last line of defense) — monitored to cancel sibling
+    call_backstop_order_id: Optional[str] = None
+    put_backstop_order_id:  Optional[str] = None
+    # Take-profit order ids (#8: verify fill before marking closed)
+    call_tp_order_id: Optional[str] = None
+    put_tp_order_id:  Optional[str] = None
+    # which short legs already closed (TP filled)
+    call_short_closed: bool = False
+    put_short_closed:  bool = False
 
     # Status
     status: str = "pending"   # pending | open | closed | stopped
@@ -119,14 +128,26 @@ def find_strike_by_delta(option_chain: list[dict],
 
 
 def calculate_mid_price(option: dict) -> float:
-    """คำนวณ mid price จาก bid/ask"""
+    """
+    คำนวณ premium ต่อ contract (ดอลลาร์) จาก bid/ask
+    quote ของ option เป็นราคา per-share → คูณ 100 (1 contract = 100 shares)
+    เช่น mid $1.50/share → $150/contract
+    """
+    bid = float(option.get("bid", 0))
+    ask = float(option.get("ask", 0))
+    mid_per_share = (bid + ask) / 2
+    return round(mid_per_share * 100, 2)   # → dollars per contract
+
+
+def calculate_mid_per_share(option: dict) -> float:
+    """mid price per-share (ใช้ตอนตั้ง limit price ของ order ซึ่งคิดเป็น per-share)"""
     bid = float(option.get("bid", 0))
     ask = float(option.get("ask", 0))
     return round((bid + ask) / 2, 2)
 
 
 def is_premium_acceptable(premium: float) -> bool:
-    """ตรวจว่า premium อยู่ในเป้าหมาย"""
+    """ตรวจว่า premium (ต่อ contract, ดอลลาร์) อยู่ในเป้าหมาย"""
     return MIN_PREMIUM_PER_SIDE <= premium <= TARGET_PREMIUM_PER_SIDE * 1.5
 
 
