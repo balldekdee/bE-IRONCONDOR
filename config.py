@@ -51,6 +51,24 @@ MARKET_CLOSE_HOUR  = 16
 MARKET_CLOSE_MIN   = 0
 LAST_ENTRY_HOUR    = 15   # ไม่เปิดสัญญาใหม่หลัง 15:00 EST
 
+# ─── Regime Intelligence Layer ────────────────────────────────────────────────
+REGIME_ENABLED            = True   # เปิด/ปิด regime filter
+ENCODER_SEQ_LEN           = 32     # ความยาว sequence ของ deep encoder (bars)
+ENCODER_DEVICE            = "cpu"  # "cuda" ถ้ามี GPU
+
+# Trade filter thresholds (ปรับความเข้มงวดของตัวกรอง)
+MIN_REGIME_CONFIDENCE     = 0.45   # confidence ขั้นต่ำที่ยอมเทรด
+MAX_CHANGE_POINT_PROB     = 0.35   # ถ้า change point สูงกว่านี้ → งดเทรด
+MIN_EXPECTED_EDGE         = 0.0    # expected edge ($) ขั้นต่ำต่อ trade
+FILTER_EXPLORATION        = True   # True=Thompson sampling, False=LCB (conservative)
+
+# บันทึก regime snapshot ทุกกี่ bar (ลด DB write)
+REGIME_SNAPSHOT_EVERY     = 3
+
+# ─── Supabase ─────────────────────────────────────────────────────────────────
+SUPABASE_URL  = os.getenv("SUPABASE_URL",  "YOUR_SUPABASE_URL")
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "YOUR_SUPABASE_SERVICE_KEY")
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_DIR            = "logs"
 LOG_LEVEL          = "INFO"

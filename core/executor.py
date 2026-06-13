@@ -18,6 +18,8 @@ from core.options_engine import (
     is_premium_acceptable, should_take_profit
 )
 from core.risk_manager import DailyRiskTracker
+from core.self_improve import SelfImprovingFilter
+from core.database import Database
 from utils.logger import log_trade
 from utils.market import is_flat_market
 from config import (
@@ -31,24 +33,45 @@ logger = logging.getLogger("0dte_bot")
 class TradeExecutor:
     """จัดการ flow ทั้งหมดของการเทรด"""
 
-    def __init__(self, broker: AlpacaBroker, risk_mgr: DailyRiskTracker):
+    def __init__(self, broker: AlpacaBroker, risk_mgr: DailyRiskTracker,
+                 regime_filter: SelfImprovingFilter = None,
+                 db: Database = None):
         self.broker   = broker
         self.risk_mgr = risk_mgr
+        self.regime_filter = regime_filter
+        self.db = db
         self.active_trades: list[IronCondor] = []
+        # เก็บ regime ตอนเข้า ต่อ trade_id (สำหรับ self-improvement)
+        self._regime_at_entry: dict[str, int] = {}
 
     def get_today_expiry(self) -> str:
         """คืน expiry วันนี้ format YYYY-MM-DD"""
         return date.today().isoformat()
 
-    def try_open_new_trade(self, bars: list[dict]) -> Optional[IronCondor]:
+    def try_open_new_trade(self, bars: list[dict], regime_state=None) -> Optional[IronCondor]:
         """
         พยายามเปิด Iron Condor ชุดใหม่
+        0. ตรวจ regime filter (เทรดเฉพาะ regime ที่มี edge)
         1. ตรวจ flat market signal
         2. ดึง option chain + เลือก strikes
         3. ตรวจ risk limit
         4. ส่งคำสั่ง (Call spread ก่อน, Put spread ทันที)
         5. ตั้ง Stop Loss OCO + Take Profit
         """
+
+        # ── Step 0: Regime Filter (self-improving) ──────────────────────────
+        regime_at_entry = None
+        expected_edge = None
+        if self.regime_filter is not None and regime_state is not None:
+            allow, reason, diag = self.regime_filter.should_trade(regime_state)
+            logger.info(f"🧭 Regime Filter | {reason}")
+            if not allow:
+                return None
+            regime_at_entry = regime_state.map_regime
+            expected_edge = diag.get("expected_edge")
+        elif regime_state is None and self.regime_filter is not None:
+            logger.info("🧭 Regime not ready (warmup) — skipping entry")
+            return None
 
         # ── Step 1: Flat Market Signal ──────────────────────────────────────
         if not is_flat_market(bars):
@@ -160,10 +183,15 @@ class TradeExecutor:
         self.risk_mgr.register_trade_open(ic)
         self.active_trades.append(ic)
 
-        log_trade({
+        # เก็บ regime ตอนเข้า (สำหรับ self-improvement ตอนปิด)
+        if regime_at_entry is not None:
+            self._regime_at_entry[ic.trade_id] = regime_at_entry
+
+        trade_record = {
             "timestamp":         __import__("datetime").datetime.now().isoformat(),
             "trade_id":          ic.trade_id,
             "action":            "OPEN",
+            "underlying_price":  ic.underlying_price,
             "call_short_strike": ic.call_short.strike,
             "call_long_strike":  ic.call_long.strike,
             "put_short_strike":  ic.put_short.strike,
@@ -173,7 +201,18 @@ class TradeExecutor:
             "total_premium":     ic.total_premium,
             "stop_loss_value":   ic.stop_loss_value,
             "expiry":            ic.expiry,
-        })
+        }
+        log_trade(trade_record)
+
+        # ── Supabase persist ──────────────────────────────────────────────────
+        if self.db is not None:
+            db_record = dict(trade_record)
+            if regime_state is not None:
+                db_record["regime_at_entry"]   = regime_at_entry
+                db_record["regime_probs"]      = regime_state.regime_probs.tolist()
+                db_record["regime_confidence"] = regime_state.confidence
+                db_record["expected_edge"]     = expected_edge
+            self.db.insert_trade(db_record)
 
         return ic
 
@@ -223,6 +262,37 @@ class TradeExecutor:
         pl1, pl2 = self.broker.place_oco_stop_on_short(ic.put_short.symbol, new_stop_value)
         ic.call_stop_order_id = sl1
         ic.put_stop_order_id  = pl1
+
+    def record_trade_outcome(self, ic: IronCondor, pnl: float, outcome: str):
+        """
+        เรียกเมื่อ trade ปิด (TP / stop / EOD)
+        → feed self-improving filter + บันทึก Supabase + update risk
+        """
+        ic.status = "closed"
+        ic.pnl = pnl
+
+        # self-improvement: อัปเดต regime-conditional edge
+        regime = self._regime_at_entry.get(ic.trade_id)
+        if regime is not None and self.regime_filter is not None:
+            self.regime_filter.record_outcome(regime, pnl)
+
+        # risk manager
+        if outcome == "stopped":
+            self.risk_mgr.register_stop_hit(ic.trade_id, abs(pnl))
+        else:
+            self.risk_mgr.register_trade_close(ic.trade_id, pnl)
+
+        # Supabase
+        if self.db is not None:
+            self.db.close_trade(ic.trade_id, pnl, outcome)
+
+        log_trade({
+            "timestamp": __import__("datetime").datetime.now().isoformat(),
+            "trade_id":  ic.trade_id,
+            "action":    "CLOSE",
+            "pnl":       pnl,
+            "outcome":   outcome,
+        })
 
     def close_all_positions_eod(self):
         """ปิดทุก position ก่อนตลาดปิด (End of Day cleanup)"""

@@ -1,2 +1,6 @@
 alpaca-py>=0.20.0
 pytz>=2024.1
+numpy>=1.26
+scipy>=1.11
+torch>=2.0
+supabase>=2.0

@@ -15,12 +15,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     LimitOrderRequest, MarketOrderRequest,
     StopLimitOrderRequest, StopOrderRequest,
-    OptionLegRequest, CreateOptionOrderRequest
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionSide
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionChainRequest, OptionBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.requests import OptionChainRequest
 
 from config import (
     ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL,
