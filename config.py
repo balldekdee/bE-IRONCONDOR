@@ -70,10 +70,12 @@ SUPABASE_URL  = os.getenv("SUPABASE_URL",  "YOUR_SUPABASE_URL")
 SUPABASE_KEY  = os.getenv("SUPABASE_KEY",  "YOUR_SUPABASE_SERVICE_KEY")
 
 # ─── Execution Safety ─────────────────────────────────────────────────────────
-DRY_RUN          = True    # True = ไม่ส่ง order จริง (log อย่างเดียว) — ทดสอบ flow ได้ปลอดภัย
-DATA_FEED        = "iex"   # "iex" สำหรับ free/paper, "sip" ถ้ามี subscription
+# DRY_RUN อ่านจาก env: export DRY_RUN=false เพื่อเปิดส่ง order จริง (default = true ปลอดภัย)
+DRY_RUN          = os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes", "on")
+DATA_FEED        = os.getenv("DATA_FEED", "iex")   # "iex" สำหรับ free/paper
 USE_LIMIT_ORDERS = True    # True = limit order ที่ mid price, False = market order
 LIMIT_SLIPPAGE_PCT = 0.10  # ยอมจ่ายเกิน mid ได้กี่ % (สำหรับ marketable limit)
+FILL_TIMEOUT_SEC   = 10    # รอ MLEG fill นานสุดกี่วินาทีก่อน cancel/abort
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_DIR            = "logs"

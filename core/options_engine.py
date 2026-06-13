@@ -42,9 +42,12 @@ class IronCondor:
     put_short:  Optional[Leg] = None
     put_long:   Optional[Leg] = None
 
-    # Premiums (filled after execution)
-    call_premium: float = 0.0
-    put_premium:  float = 0.0
+    # Premiums — เก็บเป็น "ต่อ contract (ดอลลาร์)" เสมอ (เช่น $150)
+    call_premium: float = 0.0   # per-contract $
+    put_premium:  float = 0.0   # per-contract $
+    # ราคา short ตอนเข้า — เก็บเป็น "ต่อ share" (เช่น $1.50) สำหรับคำนวณ stop order
+    call_short_entry_per_share: float = 0.0
+    put_short_entry_per_share:  float = 0.0
 
     # Stop Loss Orders
     call_stop_order_id: Optional[str] = None
@@ -63,32 +66,45 @@ class IronCondor:
     status: str = "pending"   # pending | open | closed | stopped
     pnl: float = 0.0
 
+    # ── PER-CONTRACT $ (risk / PnL / max-loss) ────────────────────────────────
     @property
     def total_premium(self) -> float:
+        """premium รวมทั้ง IC — per-contract $ (เช่น $300)"""
         return self.call_premium + self.put_premium
 
     @property
     def stop_loss_value(self) -> float:
         """
-        Stop Loss = Total Premium ที่เก็บได้ทั้งสองฝั่ง
-        ตั้งที่ขา Short แต่ละฝั่ง
+        ขีดจำกัดขาดทุนต่อฝั่ง — per-contract $
+        ตามคู่มือ: = total premium ของทั้ง IC (เช่น $300)
+        ใช้สำหรับ risk math เท่านั้น (ไม่ใช่ราคา order)
         """
         return self.total_premium
 
     @property
-    def stop_limit_price(self) -> float:
-        """ราคา Stop สำหรับ Stop Limit Order (OCO ด่านแรก)"""
-        return self.stop_loss_value
+    def stop_loss_per_share(self) -> float:
+        """
+        การเคลื่อนไหวสวนทาง (per-share) ที่ทำให้ขาดทุน = stop_loss_value
+        = stop_loss_value / 100  (เช่น $300/contract → $3.00/share)
+        นี่คือ "ระยะ" ที่ใช้คำนวณ stop order price
+        """
+        return self.stop_loss_value / 100.0
 
-    @property
-    def stop_limit_limit_price(self) -> float:
-        """Limit price ของ Stop Limit = stop + 40 จุด buffer"""
-        return self.stop_loss_value + STOP_LIMIT_BUFFER_POINTS * 0.01
+    # ── PER-SHARE $ (order prices) — ต้องมี entry price ของ short ──────────────
+    def call_stop_trigger(self) -> float:
+        """ราคา trigger ของ stop-limit ฝั่ง call — per-share (buy-to-close)"""
+        return round(self.call_short_entry_per_share + self.stop_loss_per_share, 2)
 
-    @property
-    def stop_market_trigger(self) -> float:
-        """Stop Market trigger (last line of defense) = stop + 70 จุด"""
-        return self.stop_loss_value + (STOP_LIMIT_BUFFER_POINTS + STOP_MARKET_BUFFER_POINTS) * 0.01
+    def put_stop_trigger(self) -> float:
+        return round(self.put_short_entry_per_share + self.stop_loss_per_share, 2)
+
+    def stop_limit_price(self, trigger: float) -> float:
+        """limit price ของ stop-limit = trigger + buffer (per-share)"""
+        return round(trigger + STOP_LIMIT_BUFFER_POINTS * 0.01, 2)
+
+    def stop_market_trigger(self, trigger: float) -> float:
+        """backstop stop-market trigger = trigger + limit_buffer + market_buffer (per-share, ไกลสุด)"""
+        return round(trigger + (STOP_LIMIT_BUFFER_POINTS + STOP_MARKET_BUFFER_POINTS) * 0.01, 2)
 
 
 def select_wing_width(call_premium_at_default: float,
@@ -186,14 +202,22 @@ def build_iron_condor_structure(
 
 def calculate_max_loss(ic: IronCondor) -> float:
     """
-    Max loss per side = (wing_width * 100) - premium_collected_per_side
-    คืนค่า max loss รวมทั้ง IC (กรณีชน stop ทั้งสองฝั่ง)
+    Max loss รวมทั้ง IC (per-contract $) — กรณีชน stop ทั้งสองฝั่ง (whipsaw)
+
+    หน่วย:
+      - wing width = strike points (เช่น 30)
+      - wing * 100 = ค่าสูงสุดของ spread เป็น per-contract $ (30 → $3000)
+      - ic.call_premium = per-contract $ อยู่แล้ว (เช่น $150) → ห้ามคูณ 100 ซ้ำ
+
+    ตัวอย่าง 30-wide + $150/$150:
+      call_max = 30*100 - 150 = 2850
+      put_max  = 30*100 - 150 = 2850
+      total    = 5700
     """
     call_wing = abs(ic.call_long.strike - ic.call_short.strike)
     put_wing  = abs(ic.put_short.strike - ic.put_long.strike)
-    call_max_loss = (call_wing * 100) - (ic.call_premium * 100)
-    put_max_loss  = (put_wing  * 100) - (ic.put_premium  * 100)
-    # กรณีชน double stop = max loss ทั้งสองฝั่ง - total premium
+    call_max_loss = (call_wing * 100) - ic.call_premium   # premium = per-contract $
+    put_max_loss  = (put_wing  * 100) - ic.put_premium
     return call_max_loss + put_max_loss
 
 

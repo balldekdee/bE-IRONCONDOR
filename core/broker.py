@@ -41,7 +41,7 @@ from alpaca.data.enums import DataFeed
 from config import (
     ALPACA_API_KEY, ALPACA_API_SECRET,
     UNDERLYING_SYMBOL, DRY_RUN, DATA_FEED,
-    USE_LIMIT_ORDERS, LIMIT_SLIPPAGE_PCT,
+    USE_LIMIT_ORDERS, LIMIT_SLIPPAGE_PCT, FILL_TIMEOUT_SEC,
     STOP_LIMIT_BUFFER_POINTS, STOP_MARKET_BUFFER_POINTS,
     TAKE_PROFIT_PRICE,
 )
@@ -232,59 +232,50 @@ class AlpacaBroker:
             logger.error(f"❌ place_credit_spread (MLEG) failed: {e}")
             return None
 
-    # ── #9 Real OCO stop on short leg ─────────────────────────────────────────
+    # ── #9 Synthetic OCO stop on short leg (per-share prices) ─────────────────
+    # หมายเหตุ: นี่ไม่ใช่ native OrderClass.OCO — single-leg short option ยังไม่
+    # รองรับ bracket/OCO ตรงๆ จึงทำเป็น "synthetic OCO": ส่ง stop-limit + stop-market
+    # แยกกัน แล้ว executor monitor ว่าตัวไหน fill → cancel sibling (ดู _reconcile_side)
 
-    def place_oco_stop_on_short(
-        self, short_symbol: str, stop_value: float, qty: int = 1,
+    def place_stop_limit_on_short(
+        self, short_symbol: str, trigger_per_share: float, limit_per_share: float, qty: int = 1,
     ) -> Optional[str]:
         """
-        #9: OCO จริง — stop limit + stop market link กัน (อันหนึ่ง fill → อีกอัน cancel)
-        ตั้งบนขา short เท่านั้น, side=BUY (buy-to-close)
-
-        หมายเหตุ: Alpaca OCO ต้องการ take_profit (limit) + stop_loss (stop) คู่กัน
-        เราใช้ stop_loss=stop_limit เป็นหลัก และเก็บ stop_market เป็น backstop แยก
-        ที่ monitor เอง (ดู executor) เพราะ single-leg option ยังไม่รองรับ
-        triple-bracket ตรงๆ
+        Stop-limit (ด่านแรก) บนขา short — ราคาทั้งหมด per-share
+        side=BUY (buy-to-close); trigger เมื่อราคา short ขึ้นถึง trigger_per_share
         """
-        limit_price  = round(stop_value + STOP_LIMIT_BUFFER_POINTS * 0.01, 2)
-        market_trig  = round(stop_value + (STOP_LIMIT_BUFFER_POINTS + STOP_MARKET_BUFFER_POINTS) * 0.01, 2)
-
         if DRY_RUN:
-            logger.info(f"🧪 [DRY-RUN] OCO stop on {short_symbol} | "
-                        f"StopLimit trigger=${stop_value:.2f} limit=${limit_price:.2f} | "
-                        f"StopMarket backstop=${market_trig:.2f}")
+            logger.info(f"🧪 [DRY-RUN] stop-limit {short_symbol} | "
+                        f"trigger=${trigger_per_share:.2f}/sh limit=${limit_per_share:.2f}/sh")
             return f"DRYRUN_STOP_{short_symbol}"
-
         try:
-            # ด่านแรก: stop-limit (buy to close)
             sl = self.trading.submit_order(
                 StopLimitOrderRequest(
                     symbol=short_symbol, qty=qty, side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
-                    stop_price=stop_value, limit_price=limit_price,
+                    stop_price=trigger_per_share, limit_price=limit_per_share,
                     position_intent=PositionIntent.BUY_TO_CLOSE,
                 )
             )
-            logger.info(f"🛑 Stop-limit set on {short_symbol} | "
-                        f"trigger=${stop_value:.2f} limit=${limit_price:.2f} | id={sl.id}")
-            # ด่านสอง (backstop) ตั้ง+monitor ใน executor เพื่อ cancel sibling เมื่อ fill
+            logger.info(f"🛑 Stop-limit {short_symbol} | trigger=${trigger_per_share:.2f} "
+                        f"limit=${limit_per_share:.2f} | id={sl.id}")
             return str(sl.id)
         except Exception as e:
-            logger.error(f"❌ place_oco_stop_on_short failed: {e}")
+            logger.error(f"❌ place_stop_limit_on_short failed: {e}")
             return None
 
     def place_stop_market_backstop(
-        self, short_symbol: str, trigger: float, qty: int = 1,
+        self, short_symbol: str, trigger_per_share: float, qty: int = 1,
     ) -> Optional[str]:
-        """Stop-market backstop (last line of defense) — monitor sibling ใน executor"""
+        """Stop-market backstop (ด่านสอง, ไกลสุด) — per-share, last line of defense"""
         if DRY_RUN:
-            logger.info(f"🧪 [DRY-RUN] Stop-market backstop {short_symbol} @ ${trigger:.2f}")
+            logger.info(f"🧪 [DRY-RUN] stop-market backstop {short_symbol} @ ${trigger_per_share:.2f}/sh")
             return f"DRYRUN_BACKSTOP_{short_symbol}"
         try:
             sm = self.trading.submit_order(
                 StopOrderRequest(
                     symbol=short_symbol, qty=qty, side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY, stop_price=trigger,
+                    time_in_force=TimeInForce.DAY, stop_price=trigger_per_share,
                     position_intent=PositionIntent.BUY_TO_CLOSE,
                 )
             )
@@ -296,9 +287,9 @@ class AlpacaBroker:
     def place_take_profit_on_short(
         self, short_symbol: str, qty: int = 1,
     ) -> Optional[str]:
-        """TP buy-to-close ที่ $0.05 บนขา short (limit order มีราคาจริง)"""
+        """TP buy-to-close ที่ $0.05/share บนขา short (per-share limit)"""
         if DRY_RUN:
-            logger.info(f"🧪 [DRY-RUN] TP on {short_symbol} @ ${TAKE_PROFIT_PRICE}")
+            logger.info(f"🧪 [DRY-RUN] TP {short_symbol} @ ${TAKE_PROFIT_PRICE}/sh")
             return f"DRYRUN_TP_{short_symbol}"
         try:
             tp = self.trading.submit_order(
@@ -308,7 +299,7 @@ class AlpacaBroker:
                     position_intent=PositionIntent.BUY_TO_CLOSE,
                 )
             )
-            logger.info(f"🎯 TP set on {short_symbol} @ ${TAKE_PROFIT_PRICE} | id={tp.id}")
+            logger.info(f"🎯 TP {short_symbol} @ ${TAKE_PROFIT_PRICE}/sh | id={tp.id}")
             return str(tp.id)
         except Exception as e:
             logger.error(f"❌ place_take_profit_on_short failed: {e}")
@@ -326,12 +317,47 @@ class AlpacaBroker:
             logger.warning(f"⚠️ get_order {order_id}: {e}")
             return None
 
-    def is_order_filled(self, order_id: str) -> bool:
-        """#8: เช็คว่า order fill จริงไหม"""
+    def order_status(self, order_id: str) -> str:
+        """
+        คืนสถานะ order แบบ normalized string:
+          filled | partially_filled | canceled | rejected | expired | pending | unknown
+        DRY-RUN → 'filled' (สมมติว่า fill ทันที)
+        """
+        if DRY_RUN or (order_id and order_id.startswith("DRYRUN")):
+            return "filled"
         o = self.get_order(order_id)
         if o is None:
-            return False
-        return str(o.status).lower() in ("orderstatus.filled", "filled")
+            return "unknown"
+        s = str(o.status).lower().split(".")[-1]
+        if s in ("filled",): return "filled"
+        if s in ("partially_filled",): return "partially_filled"
+        if s in ("canceled", "cancelled"): return "canceled"
+        if s in ("rejected",): return "rejected"
+        if s in ("expired",): return "expired"
+        return "pending"
+
+    def wait_for_fill(self, order_id: str, timeout: int = None, poll: float = 1.0) -> str:
+        """
+        #5: รอ order fill ก่อนดำเนินการต่อ (ตั้ง TP/Stop)
+        คืนสถานะสุดท้าย: filled | canceled | rejected | expired | partially_filled | pending(timeout)
+        DRY-RUN → 'filled' ทันที
+        """
+        if DRY_RUN or (order_id and order_id.startswith("DRYRUN")):
+            return "filled"
+        import time as _t
+        timeout = timeout if timeout is not None else FILL_TIMEOUT_SEC
+        elapsed = 0.0
+        while elapsed < timeout:
+            st = self.order_status(order_id)
+            if st in ("filled", "canceled", "rejected", "expired"):
+                return st
+            _t.sleep(poll)
+            elapsed += poll
+        return self.order_status(order_id)   # last check (อาจ pending/partially_filled)
+
+    def is_order_filled(self, order_id: str) -> bool:
+        """#8: เช็คว่า order fill จริงไหม"""
+        return self.order_status(order_id) == "filled"
 
     def cancel_order(self, order_id: str):
         if DRY_RUN or (order_id and order_id.startswith("DRYRUN")):

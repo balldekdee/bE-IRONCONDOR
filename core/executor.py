@@ -134,8 +134,11 @@ class TradeExecutor:
             put_long_strike=put_long_strike,
             underlying_symbol=UNDERLYING_SYMBOL,
         )
-        ic.call_premium = call_premium_est
+        ic.call_premium = call_premium_est   # per-contract $
         ic.put_premium  = put_premium_est
+        # short entry prices (per-share) — สำหรับคำนวณ stop order price
+        ic.call_short_entry_per_share = calculate_mid_per_share(call_short_opt)
+        ic.put_short_entry_per_share  = calculate_mid_per_share(put_short_opt)
 
         # ── Step 6: Risk check ────────────────────────────────────────────────
         account = self.broker.get_account()
@@ -153,42 +156,66 @@ class TradeExecutor:
         logger.info(
             f"\n{'─'*50}\n"
             f"🚀 Opening IC | {trade_id}\n"
-            f"   Call Spread: {call_short_strike}C / {call_long_strike}C | Premium: ${call_premium_est:.2f}\n"
-            f"   Put  Spread: {put_short_strike}P / {put_long_strike}P  | Premium: ${put_premium_est:.2f}\n"
-            f"   Total Premium: ${ic.total_premium:.2f} | Stop Loss: ${ic.stop_loss_value:.2f}\n"
+            f"   Call Spread: {call_short_strike}C / {call_long_strike}C | Premium: ${call_premium_est:.0f}/contract\n"
+            f"   Put  Spread: {put_short_strike}P / {put_long_strike}P  | Premium: ${put_premium_est:.0f}/contract\n"
+            f"   Total Premium: ${ic.total_premium:.0f} | Stop/side: ${ic.stop_loss_value:.0f} "
+            f"(= ${ic.stop_loss_per_share:.2f}/share adverse)\n"
             f"{'─'*50}"
         )
 
-        # Call spread (atomic) — net credit per-share สำหรับ limit price
+        # Call spread (atomic MLEG)
         call_order_id = self.broker.place_credit_spread(
             ic.call_short.symbol, ic.call_long.symbol, net_credit=call_credit_per_share,
         )
         if not call_order_id:
-            logger.error("❌ Call spread failed — aborting trade (no legs opened)")
+            logger.error("❌ Call spread submit failed — no trade registered")
+            return None
+        # #5: รอ fill confirm ก่อนไปต่อ
+        call_status = self.broker.wait_for_fill(call_order_id)
+        if call_status != "filled":
+            # #6/#7: rejected/canceled/expired/partial/pending → ยกเลิกถ้ายัง pending, ไม่ register
+            logger.error(f"❌ Call spread not filled (status={call_status}) — aborting")
+            if call_status in ("pending", "partially_filled"):
+                self.broker.cancel_order(call_order_id)
             return None
 
-        # Put spread (atomic) — net credit per-share
+        # Put spread (atomic MLEG)
         put_order_id = self.broker.place_credit_spread(
             ic.put_short.symbol, ic.put_long.symbol, net_credit=put_credit_per_share,
         )
         if not put_order_id:
-            # #6 rollback: call spread เปิดไปแล้ว → ต้องปิดทันที ไม่ให้เหลือ exposure ข้างเดียว
-            logger.error("❌ Put spread failed — rolling back call spread to avoid one-sided exposure")
-            self.broker.close_option_leg(ic.call_short.symbol, is_short=True)
-            self.broker.close_option_leg(ic.call_long.symbol,  is_short=False)
+            # #7 rollback: call filled แล้ว → ปิด call legs
+            logger.error("❌ Put spread submit failed — rolling back filled call spread")
+            self._rollback_call_spread(ic, call_order_id, call_filled=True)
+            return None
+        put_status = self.broker.wait_for_fill(put_order_id)
+        if put_status != "filled":
+            logger.error(f"❌ Put spread not filled (status={put_status}) — rolling back")
+            # ยกเลิก put order ถ้ายัง pending/partial ก่อน
+            if put_status in ("pending", "partially_filled"):
+                self.broker.cancel_order(put_order_id)
+            # call filled แล้ว → ปิด call legs
+            self._rollback_call_spread(ic, call_order_id, call_filled=True)
             return None
 
         ic.call_short.order_id = call_order_id
         ic.put_short.order_id  = put_order_id
         ic.status = "open"
 
-        # ── Step 8: Stop loss — stop-limit + stop-market backstop (#9) ────────
-        ic.call_stop_order_id     = self.broker.place_oco_stop_on_short(ic.call_short.symbol, ic.stop_loss_value)
-        ic.call_backstop_order_id = self.broker.place_stop_market_backstop(ic.call_short.symbol, ic.stop_market_trigger)
-        ic.put_stop_order_id      = self.broker.place_oco_stop_on_short(ic.put_short.symbol, ic.stop_loss_value)
-        ic.put_backstop_order_id  = self.broker.place_stop_market_backstop(ic.put_short.symbol, ic.stop_market_trigger)
+        # ── Step 8: Stop loss — stop-limit + stop-market backstop (per-share) ──
+        # ราคา trigger คิดจาก short entry (per-share) + stop_loss_per_share
+        call_trig = ic.call_stop_trigger()
+        put_trig  = ic.put_stop_trigger()
+        ic.call_stop_order_id     = self.broker.place_stop_limit_on_short(
+            ic.call_short.symbol, call_trig, ic.stop_limit_price(call_trig))
+        ic.call_backstop_order_id = self.broker.place_stop_market_backstop(
+            ic.call_short.symbol, ic.stop_market_trigger(call_trig))
+        ic.put_stop_order_id      = self.broker.place_stop_limit_on_short(
+            ic.put_short.symbol, put_trig, ic.stop_limit_price(put_trig))
+        ic.put_backstop_order_id  = self.broker.place_stop_market_backstop(
+            ic.put_short.symbol, ic.stop_market_trigger(put_trig))
 
-        # ── Step 9: Take Profit at $0.05 (เก็บ id ไว้ verify fill — #8) ───────
+        # ── Step 9: Take Profit at $0.05/share (เก็บ id ไว้ verify fill — #8) ──
         ic.call_tp_order_id = self.broker.place_take_profit_on_short(ic.call_short.symbol)
         ic.put_tp_order_id  = self.broker.place_take_profit_on_short(ic.put_short.symbol)
 
@@ -298,15 +325,17 @@ class TradeExecutor:
                 return
             return
 
-        # ── DRY-RUN: ไม่มี order จริง → ประเมินจาก quote ──
+        # ── DRY-RUN: ไม่มี order จริง → ประเมินจาก quote (per-share) ──
         price = self.broker.get_option_quote(short_sym)   # per-share
         if price is None:
             return
+        trigger = ic.call_stop_trigger() if side == "call" else ic.put_stop_trigger()
         if should_take_profit(price):
-            logger.info(f"🧪 [DRY-RUN][{side}] TP hit @ ${price:.2f} | short closed, long reuse")
+            logger.info(f"🧪 [DRY-RUN][{side}] TP hit @ ${price:.2f}/sh | short closed, long reuse")
             self._mark_short_closed(ic, side)
-        elif price * 100 >= ic.stop_loss_value:   # per-share→per-contract เทียบ stop
-            logger.warning(f"🧪 [DRY-RUN][{side}] Stop hit @ ${price*100:.0f}/contract | closing long")
+        elif price >= trigger:   # per-share vs per-share trigger
+            logger.warning(f"🧪 [DRY-RUN][{side}] Stop hit @ ${price:.2f}/sh "
+                           f"(trigger ${trigger:.2f}) | closing long")
             self.broker.close_option_leg(long_sym, is_short=False)
             self._mark_short_closed(ic, side, stopped=True)
 
@@ -331,14 +360,33 @@ class TradeExecutor:
         outcome = "stopped" if stopped else ("win" if pnl > 0 else "loss")
         self.record_trade_outcome(ic, pnl, outcome)
 
-    def tighten_stop_losses(self, ic: IronCondor, new_stop_value: float):
-        """ขยับ Stop Loss ให้แน่นขึ้น (Trailing Stop)"""
-        logger.info(f"🔧 Tightening stops on {ic.trade_id} → ${new_stop_value:.2f}")
+    def _rollback_call_spread(self, ic: IronCondor, call_order_id: str, call_filled: bool):
+        """
+        #7 rollback: ถ้า opening order ยัง pending → cancel; ถ้า filled → ปิด legs
+        """
+        status = self.broker.order_status(call_order_id)
+        if status == "filled" or call_filled:
+            logger.warning("↩️ Rollback: call spread filled — closing call legs")
+            self.broker.close_option_leg(ic.call_short.symbol, is_short=True)
+            self.broker.close_option_leg(ic.call_long.symbol,  is_short=False)
+        else:
+            logger.warning(f"↩️ Rollback: call spread {status} — cancelling order")
+            self.broker.cancel_order(call_order_id)
+
+    def tighten_stop_losses(self, ic: IronCondor, new_per_share_offset: float):
+        """
+        ขยับ Stop Loss ให้แน่นขึ้น (Trailing Stop) — offset เป็น per-share
+        """
+        logger.info(f"🔧 Tightening stops on {ic.trade_id} → +${new_per_share_offset:.2f}/share")
         for oid in (ic.call_stop_order_id, ic.put_stop_order_id):
             if oid:
                 self.broker.cancel_order(oid)
-        ic.call_stop_order_id = self.broker.place_oco_stop_on_short(ic.call_short.symbol, new_stop_value)
-        ic.put_stop_order_id  = self.broker.place_oco_stop_on_short(ic.put_short.symbol, new_stop_value)
+        call_trig = round(ic.call_short_entry_per_share + new_per_share_offset, 2)
+        put_trig  = round(ic.put_short_entry_per_share + new_per_share_offset, 2)
+        ic.call_stop_order_id = self.broker.place_stop_limit_on_short(
+            ic.call_short.symbol, call_trig, ic.stop_limit_price(call_trig))
+        ic.put_stop_order_id  = self.broker.place_stop_limit_on_short(
+            ic.put_short.symbol, put_trig, ic.stop_limit_price(put_trig))
 
     def record_trade_outcome(self, ic: IronCondor, pnl: float, outcome: str):
         """

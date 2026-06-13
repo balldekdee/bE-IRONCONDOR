@@ -210,3 +210,38 @@ DRY_RUN = True   # ไม่ส่ง order จริง — log อย่าง
 1. `DRY_RUN=True` → ดู log ว่า entry/exit logic ถูกต้อง
 2. `DRY_RUN=False` + เงินน้อย → ดูว่า order ส่งเข้า Alpaca ถูก
 3. รัน paper เต็มเดือน → ดู regime filter + self-improving edge
+
+---
+
+# 🔬 Unit Consistency Pass (v4)
+
+แก้ unit mismatch per-share vs per-contract ทั้งระบบ (bug สำคัญที่สุด) + harden order lifecycle
+
+## Unit Convention (บังคับใช้ทั้ง codebase)
+
+| ประเภท | หน่วย | ตัวอย่าง |
+|--------|-------|---------|
+| ราคา option (quote, stop trigger, limit, TP) | **per-share** $ | $1.50, $4.50, $0.05 |
+| premium / risk / max-loss / PnL | **per-contract** $ (= per-share × 100) | $150, $300, $5700 |
+
+## Fixes
+
+| Item | Fix |
+|------|-----|
+| `calculate_max_loss()` คูณ ×100 ซ้ำ | premium เป็น per-contract แล้ว → ไม่คูณซ้ำ → 30-wide+$150/$150 = **$5700** |
+| stop price เป็น 300 (per-contract) | stop trigger = short_entry + `stop_loss_per_share` ($3.00) = **$4.50/share** |
+| TP/stop ใช้หน่วยปน | TP=$0.05/share, stop=per-share, risk=per-contract แยกชัด |
+| ไม่รอ fill ก่อนตั้ง TP/stop | `wait_for_fill()` หลัง submit MLEG ก่อนตั้ง stop/TP |
+| MLEG rejected/partial/pending | handle ทุก status → ไม่ register trade, ไม่ส่ง stop/TP |
+| rollback ไม่ cancel pending | `_rollback_call_spread()`: pending→cancel, filled→close legs |
+| `DRY_RUN` hardcoded | อ่านจาก env: `export DRY_RUN=false` |
+| comment OCO ผิด | แก้เป็น "synthetic OCO" (monitor sibling) ตรงกับ implementation จริง |
+
+## Tests (`tests/test_units_and_orders.py`)
+
+```bash
+python tests/test_units_and_orders.py   # 9/9 passed
+```
+
+ครอบคลุม: max_loss=$5700, stop offset=$3.00, not-filled→no orders,
+rejected→no trade, put-fail→rollback, DRY_RUN true/false submit behavior
